@@ -1,34 +1,19 @@
 #!/usr/bin/env python
 
 """
-Automatic collecting waypoints for a loop.
+waypoint_follower_01.py
 """
 
 from __future__ import print_function
 
 
 # ==============================================================================
-# -- find carla module ---------------------------------------------------------
+# -- imports -------------------------------------------------------------------
 # ==============================================================================
-
 
 import glob
 import os
 import sys
-
-try:
-    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
-        sys.version_info.major,
-        sys.version_info.minor,
-        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-except IndexError:
-    pass
-
-
-# ==============================================================================
-# -- imports -------------------------------------------------------------------
-# ==============================================================================
-
 
 import carla
 
@@ -42,24 +27,71 @@ import math
 import random
 import re
 import weakref
+import csv
+import configparser
+import pygame
+import numpy as np
+import time
 
-try:
-    import pygame
-except ImportError:
-    raise RuntimeError('cannot import pygame, make sure pygame package is installed')
-
-try:
-    import numpy as np
-except ImportError:
-    raise RuntimeError('cannot import numpy, make sure numpy package is installed')
+sys.path.append('./helper')
+# Script level imports
+import controller2d
 
 
 # ==============================================================================
-# -- Hard coded variables-------------------------------------------------------
+# -- Configurable params ----------------------------------------------------------
 # ==============================================================================
 
 
-OUTPUT_FOLDER = 'recorded_waypoints'
+ITER_FOR_SIM_TIMESTEP  = 10     # no. iterations to compute approx sim timestep
+WAIT_TIME_BEFORE_START = 5.00   # game seconds (time before controller start)
+TOTAL_RUN_TIME         = 200.00 # game seconds (total runtime before sim end)
+TOTAL_FRAME_BUFFER     = 300    # number of frames to buffer after total runtime
+NUM_PEDESTRIANS        = 0      # total number of pedestrians to spawn
+NUM_VEHICLES           = 0      # total number of vehicles to spawn
+SEED_PEDESTRIANS       = 0      # seed for pedestrian spawn randomizer
+SEED_VEHICLES          = 0      # seed for vehicle spawn randomizer
+
+WEATHERID = {
+    "DEFAULT": 0,
+    "CLEARNOON": 1,
+    "CLOUDYNOON": 2,
+    "WETNOON": 3,
+    "WETCLOUDYNOON": 4,
+    "MIDRAINYNOON": 5,
+    "HARDRAINNOON": 6,
+    "SOFTRAINNOON": 7,
+    "CLEARSUNSET": 8,
+    "CLOUDYSUNSET": 9,
+    "WETSUNSET": 10,
+    "WETCLOUDYSUNSET": 11,
+    "MIDRAINSUNSET": 12,
+    "HARDRAINSUNSET": 13,
+    "SOFTRAINSUNSET": 14,
+}
+SIMWEATHER = WEATHERID["CLEARNOON"]     # set simulation weather
+
+PLAYER_START_INDEX = 1      # spawn index for player (keep to 1)
+FIGSIZE_X_INCHES   = 8      # x figure size of feedback in inches
+FIGSIZE_Y_INCHES   = 8      # y figure size of feedback in inches
+PLOT_LEFT          = 0.1    # in fractions of figure width and height
+PLOT_BOT           = 0.1
+PLOT_WIDTH         = 0.8
+PLOT_HEIGHT        = 0.8
+
+WAYPOINTS_FILENAME = 'recorded_waypoints/waypoints.txt'  # waypoint file to load
+DIST_THRESHOLD_TO_LAST_WAYPOINT = 1.0  # some distance from last position before
+                                       # simulation ends
+
+# Path interpolation parameters
+INTERP_MAX_POINTS_PLOT    = 10   # number of points used for displaying
+                                 # lookahead path
+INTERP_LOOKAHEAD_DISTANCE = 20   # lookahead in meters
+INTERP_DISTANCE_RES       = 0.01 # distance between interpolated points
+
+# controller output directory
+CONTROLLER_OUTPUT_FOLDER = os.path.dirname(os.path.realpath(__file__)) +\
+                           '/controller_output/'
 
 
 # ==============================================================================
@@ -79,19 +111,9 @@ def get_actor_display_name(actor, truncate=250):
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
 
 
-def create_output_dir(output_folder):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-
-def write_to_file(x_list, y_list, v_list):
-    create_output_dir(OUTPUT_FOLDER)
-    file_name = os.path.join(OUTPUT_FOLDER, 'waypoints.txt')
-
-    with open(file_name, 'w') as waypoints_file:
-        for i in range(len(x_list)):
-            waypoints_file.write('%3.3f, %3.3f, %2.3f\n' %\
-                                  (x_list[i], y_list[i], v_list[i]))
+# ==============================================================================
+# -- Helper Functions ----------------------------------------------------------
+# ==============================================================================
 
 
 def get_current_pose(actor):
@@ -111,6 +133,66 @@ def get_current_pose(actor):
     yaw = math.radians(actor.get_transform().rotation.yaw)
 
     return (x, y, yaw)
+
+
+def get_current_speed(actor):
+    """
+    Obtains the current speed.
+
+    Args:
+        actor:
+
+    Returns: 
+        speed: absolute velocity in m/s
+    """
+    v = actor.get_velocity()
+    speed = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+    return speed
+
+
+def load_waypoints():
+    #############################################
+    # Load Waypoints
+    #############################################
+    # Opens the waypoint file and stores it to "waypoints"
+    waypoints_file = WAYPOINTS_FILENAME
+    waypoints_np   = None
+    with open(waypoints_file) as waypoints_file_handle:
+        waypoints = list(csv.reader(waypoints_file_handle,
+                                    delimiter=',',
+                                    quoting=csv.QUOTE_NONNUMERIC))
+        waypoints_np = np.array(waypoints)
+    return waypoints
+
+
+def send_control_command(player,
+                         throttle, steer, brake,
+                         hand_brake=False, reverse=False):
+    """
+
+    Send control command to the player.
+
+    Args:
+        player: The actor under control
+        throttle: Throttle command for the sim car [0, 1]
+        steer: Steer command for the sim car [-1, 1]
+        brake: Brake command for the sim car [0, 1]
+        hand_brake: Whether the hand brake is engaged
+        reverse: Whether the sim car is in the reverse gear
+    """
+    control = carla.VehicleControl()
+    # Clamp all values within their limits
+    steer = np.fmax(np.fmin(steer, 1.0), -1.0)
+    throttle = np.fmax(np.fmin(throttle, 1.0), 0)
+    brake = np.fmax(np.fmin(brake, 1.0), 0)
+
+    control.steer = steer
+    control.throttle = throttle
+    control.brake = brake
+    control.hand_brake = hand_brake
+    control.reverse = reverse
+    player.apply_control(control)
 
 
 # ==============================================================================
@@ -159,9 +241,11 @@ class World(object):
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
         while self.player is None:
             spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            # spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            spawn_point = spawn_points[0]
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-        self.player.set_autopilot(True)
+        print('The num of spawn points = {}'.format(len(spawn_points)))
+        print('spawn point: {}, {}, {}'.format(spawn_point.location.x, spawn_point.location.y, spawn_point.rotation.yaw))
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
@@ -607,16 +691,6 @@ def game_loop(args):
     pygame.font.init()
     world = None
 
-    # record a track loop
-    x_list = []
-    y_list = []
-    yaw_list = []
-    v_list = []
-    start_pose = None
-    prev_pose = None
-    distance = 0
-    end_thresh =  0.5 # meter
-
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(2.0)
@@ -627,44 +701,295 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height)
         world = World(client.get_world(), hud, args.filter, args.rolename)
-        #controller = KeyboardControl(world, args.autopilot)
 
         clock = pygame.time.Clock()
+
+        #############################################
+        # Load Configurations
+        #############################################
+
+        # Load configuration file (options.cfg) and then parses for the various
+        # options. Here we have two main options:
+        # live_plotting and live_plotting_period, which controls whether
+        # live plotting is enabled or how often the live plotter updates
+        # during the simulation run.
+        config = configparser.ConfigParser()
+        config.read(os.path.join(
+                os.path.dirname(os.path.realpath(__file__)), 'options.cfg'))
+        demo_opt = config['Demo Parameters']
+
+        #############################################
+        # Load Waypoints
+        #############################################
+        # Opens the waypoint file and stores it to "waypoints"
+        waypoints_file = WAYPOINTS_FILENAME
+        waypoints_np   = None
+        with open(waypoints_file) as waypoints_file_handle:
+            waypoints = list(csv.reader(waypoints_file_handle,
+                                        delimiter=',',
+                                        quoting=csv.QUOTE_NONNUMERIC))
+            waypoints_np = np.array(waypoints)
+
+        # Because the waypoints are discrete and our controller performs better
+        # with a continuous path, here we will send a subset of the waypoints
+        # within some lookahead distance from the closest point to the vehicle.
+        # Interpolating between each waypoint will provide a finer resolution
+        # path and make it more "continuous". A simple linear interpolation
+        # is used as a preliminary method to address this issue, though it is
+        # better addressed with better interpolation methods (spline
+        # interpolation, for example).
+        # More appropriate interpolation methods will not be used here for the
+        # sake of demonstration on what effects discrete paths can have on
+        # the controller. It is made much more obvious with linear
+        # interpolation, because in a way part of the path will be continuous
+        # while the discontinuous parts (which happens at the waypoints) will
+        # show just what sort of effects these points have on the controller.
+        # Can you spot these during the simulation? If so, how can you further
+        # reduce these effects?
+
+        # Linear interpolation computations
+        # Compute a list of distances between waypoints
+        wp_distance = []   # distance array
+        for i in range(1, waypoints_np.shape[0]):
+            wp_distance.append(
+                    np.sqrt((waypoints_np[i, 0] - waypoints_np[i-1, 0])**2 +
+                            (waypoints_np[i, 1] - waypoints_np[i-1, 1])**2))
+        wp_distance.append(0)  # last distance is 0 because it is the distance
+                               # from the last waypoint to the last waypoint
+
+        # Linearly interpolate between waypoints and store in a list
+        wp_interp      = []    # interpolated values
+                               # (rows = waypoints, columns = [x, y, v])
+        wp_interp_hash = []    # hash table which indexes waypoints_np
+                               # to the index of the waypoint in wp_interp
+        interp_counter = 0     # counter for current interpolated point index
+        for i in range(waypoints_np.shape[0] - 1):
+            # Add original waypoint to interpolated waypoints list (and append
+            # it to the hash table)
+            wp_interp.append(list(waypoints_np[i]))
+            wp_interp_hash.append(interp_counter)
+            interp_counter+=1
+
+            # Interpolate to the next waypoint. First compute the number of
+            # points to interpolate based on the desired resolution and
+            # incrementally add interpolated points until the next waypoint
+            # is about to be reached.
+            num_pts_to_interp = int(np.floor(wp_distance[i] /\
+                                         float(INTERP_DISTANCE_RES)) - 1)
+            wp_vector = waypoints_np[i+1] - waypoints_np[i]
+            wp_uvector = wp_vector / np.linalg.norm(wp_vector)
+            for j in range(num_pts_to_interp):
+                next_wp_vector = INTERP_DISTANCE_RES * float(j+1) * wp_uvector
+                wp_interp.append(list(waypoints_np[i] + next_wp_vector))
+                interp_counter+=1
+        # add last waypoint at the end
+        wp_interp.append(list(waypoints_np[-1]))
+        wp_interp_hash.append(interp_counter)
+        interp_counter+=1
+
+        #############################################
+        # Controller 2D Class Declaration
+        #############################################
+        # This is where we take the controller2d.py class
+        # and apply it to the simulator
+        controller = controller2d.Controller2D(waypoints, args.control_method)
+
+        #############################################
+        # Determine simulation average timestep (and total frames)
+        #############################################
+        # Ensure at least one frame is used to compute average timestep
+        num_iterations = ITER_FOR_SIM_TIMESTEP
+        if (ITER_FOR_SIM_TIMESTEP < 1):
+            num_iterations = 1
+
+        # Gather current data from the CARLA server. This is used to get the
+        # simulator starting game time. Note that we also need to
+        # send a command back to the CARLA server because synchronous mode
+        # is enabled.
+        sim_start_stamp = float(world.world.wait_for_tick().elapsed_seconds)
+        world.tick(clock)
+        print(sim_start_stamp)
+        # Send a control command to proceed to next iteration.
+        # This mainly applies for simulations that are in synchronous mode.
+        send_control_command(world.player, throttle=0.0, steer=0, brake=1.0)
+        # Computes the average timestep based on several initial iterations
+        sim_duration = 0
+        for i in range(num_iterations):
+            # Send a control command to proceed to next iteration
+            send_control_command(world.player, throttle=0.0, steer=0, brake=1.0)
+            # Last stamp
+            if i == num_iterations - 1:
+                sim_duration = float(world.world.wait_for_tick().elapsed_seconds) -\
+                               sim_start_stamp
+                world.tick(clock)
+                print(sim_duration)
+
+        # Outputs average simulation timestep and computes how many frames
+        # will elapse before the simulation should end based on various
+        # parameters that we set in the beginning.
+        SIMULATION_TIME_STEP = sim_duration / float(num_iterations)
+        print("SERVER SIMULATION STEP APPROXIMATION: " + \
+              str(SIMULATION_TIME_STEP))
+        TOTAL_EPISODE_FRAMES = int((TOTAL_RUN_TIME + WAIT_TIME_BEFORE_START) /\
+                               SIMULATION_TIME_STEP) + TOTAL_FRAME_BUFFER
+
+        #############################################
+        # Frame-by-Frame Iteration and Initialization
+        #############################################
+        # Store pose history starting from the start position
+        start_x, start_y, start_yaw = get_current_pose(world.player)
+        send_control_command(world.player, throttle=0.0, steer=0, brake=1.0)
+
+        # Iterate the frames until the end of the waypoints is reached or
+        # the TOTAL_EPISODE_FRAMES is reached. The controller simulation then
+        # ouptuts the results to the controller output directory.
+        reached_the_end = False
+        skip_first_frame = True
+        closest_index    = 0  # Index of waypoint that is currently closest to
+                              # the car (assumed to be the first index)
+        closest_distance = 0  # Closest distance of closest waypoint to car
+
+        frame = -1
         while True:
+            frame += 1
             clock.tick_busy_loop(60)
             # if controller.parse_events(client, world, clock):
             #     return
+            # Update the other controller values and controls
+            # Update pose, timestamp
+            current_x, current_y, current_yaw = get_current_pose(world.player)
+            current_speed = get_current_speed(world.player)
+            current_timestamp = float(world.world.wait_for_tick().elapsed_seconds)
             world.tick(clock)
-            curr_pose = world.player.get_location()
-            curr_yaw = math.radians(world.player.get_transform().rotation.yaw)
-            curr_vel = world.player.get_velocity()
-            curr_speed = math.sqrt( math.pow(curr_vel.x, 2) + math.pow(curr_vel.y, 2) )
+
+            # Shift x, y coordinates
+            if args.control_method == 'PurePursuit':
+                length = -1.5
+            elif args.control_method == 'Stanley' or args.control_method == 'MPC':
+                length = 1.5
+            else:
+                length = 0.0
+
+            current_x, current_y = controller.get_shifted_coordinate(current_x, current_y, current_yaw, length)
+
+            # Wait for some initial time before starting the demo
+            if current_timestamp <= WAIT_TIME_BEFORE_START:
+                send_control_command(world.player, throttle=0.0, steer=0, brake=1.0)
+                continue
+            else:
+                current_timestamp = current_timestamp - WAIT_TIME_BEFORE_START
+
+            ###
+            # Controller update (this uses the controller2d.py implementation)
+            ###
+
+            # To reduce the amount of waypoints sent to the controller,
+            # provide a subset of waypoints that are within some
+            # lookahead distance from the closest point to the car. Provide
+            # a set of waypoints behind the car as well.
+
+            # Find closest waypoint index to car. First increment the index
+            # from the previous index until the new distance calculations
+            # are increasing. Apply the same rule decrementing the index.
+            # The final index should be the closest point (it is assumed that
+            # the car will always break out of instability points where there
+            # are two indices with the same minimum distance, as in the
+            # center of a circle)
+            closest_distance = np.linalg.norm(np.array([
+                    waypoints_np[closest_index, 0] - current_x,
+                    waypoints_np[closest_index, 1] - current_y]))
+
+            new_distance = closest_distance
+            new_index = closest_index
+            while new_distance <= closest_distance:
+                closest_distance = new_distance
+                closest_index = new_index
+                new_index += 1
+                if new_index >= waypoints_np.shape[0]:  # End of path
+                    break
+                new_distance = np.linalg.norm(np.array([
+                        waypoints_np[new_index, 0] - current_x,
+                        waypoints_np[new_index, 1] - current_y]))
+            new_distance = closest_distance
+            new_index = closest_index
+            while new_distance <= closest_distance:
+                closest_distance = new_distance
+                closest_index = new_index
+                new_index -= 1
+                if new_index < 0:  # Beginning of path
+                    break
+                new_distance = np.linalg.norm(np.array([
+                        waypoints_np[new_index, 0] - current_x,
+                        waypoints_np[new_index, 1] - current_y]))
+
+            # Once the closest index is found, return the path that has 1
+            # waypoint behind and X waypoints ahead, where X is the index
+            # that has a lookahead distance specified by
+            # INTERP_LOOKAHEAD_DISTANCE
+            waypoint_subset_first_index = closest_index - 1
+            if waypoint_subset_first_index < 0:
+                waypoint_subset_first_index = 0
+
+            waypoint_subset_last_index = closest_index
+            total_distance_ahead = 0
+            while total_distance_ahead < INTERP_LOOKAHEAD_DISTANCE:
+                total_distance_ahead += wp_distance[waypoint_subset_last_index]
+                waypoint_subset_last_index += 1
+                if waypoint_subset_last_index >= waypoints_np.shape[0]:
+                    waypoint_subset_last_index = waypoints_np.shape[0] - 1
+                    break
+
+            # Use the first and last waypoint subset indices into the hash
+            # table to obtain the first and last indicies for the interpolated
+            # list. Update the interpolated waypoints to the controller
+            # for the next controller update.
+            new_waypoints = \
+                    wp_interp[wp_interp_hash[waypoint_subset_first_index]:\
+                              wp_interp_hash[waypoint_subset_last_index] + 1]
+            controller.update_waypoints(new_waypoints)
+
+            # Update the other controller values and controls
+            controller.update_values(current_x, current_y, current_yaw,
+                                     current_speed,
+                                     current_timestamp, frame, new_distance)
+            controller.update_controls()
+            cmd_throttle, cmd_steer, cmd_brake = controller.get_commands()
+
+            print('cmd: {}, {}, {}'.format(cmd_throttle, cmd_steer, cmd_brake))
+
+            # Skip the first frame (so the controller has proper outputs)
+            if skip_first_frame and frame == 0:
+                pass
+            else:
+                # When plotting lookahead path, only plot a number of points
+                # (INTERP_MAX_POINTS_PLOT amount of points). This is meant
+                # to decrease load when live plotting
+                new_waypoints_np = np.array(new_waypoints)
+                path_indices = np.floor(np.linspace(0,
+                                                    new_waypoints_np.shape[0]-1,
+                                                    INTERP_MAX_POINTS_PLOT))
+
+            # Output controller command to CARLA server
+            send_control_command(world.player,
+                                 throttle=cmd_throttle,
+                                 steer=cmd_steer,
+                                 brake=cmd_brake)
+
+            # Find if reached the end of waypoint. If the car is within
+            # DIST_THRESHOLD_TO_LAST_WAYPOINT to the last waypoint,
+            # the simulation will end.
+            dist_to_last_waypoint = np.linalg.norm(np.array([
+                waypoints[-1][0] - current_x,
+                waypoints[-1][1] - current_y]))
+            if  dist_to_last_waypoint < DIST_THRESHOLD_TO_LAST_WAYPOINT:
+                reached_the_end = True
+            if reached_the_end:
+                break
+
+            world.tick(clock)
             world.render(display)
             pygame.display.flip()
 
-            if start_pose == None:
-                start_pose = curr_pose
-                prev_pose = start_pose
-            else:
-                dist_to_origin = math.sqrt(math.pow(start_pose.x - curr_pose.x, 2) \
-                    + math.pow(start_pose.y - curr_pose.y, 2))
-                dist_to_prev = math.sqrt(math.pow(curr_pose.x - prev_pose.x, 2) \
-                    + math.pow(curr_pose.y - prev_pose.y, 2))
-                distance += dist_to_prev
-                if dist_to_prev > 0.5:
-                    print('Waypoint: x = {}, y = {}, v = {}'.format(curr_pose.x, curr_pose.y, curr_speed))
-                    x_list.append(curr_pose.x)
-                    y_list.append(curr_pose.y)
-                    v_list.append(curr_speed)
-                if distance > 100 and dist_to_origin < end_thresh:
-                    print('A loop is recorded!')
-                    write_to_file(x_list, y_list, v_list)
-                    break
-                elif distance > 1000:
-                    print('A track without a loop is recorded!')
-                    write_to_file(x_list, y_list, v_list)
-                    break
-            prev_pose = curr_pose
 
     finally:
 
@@ -683,8 +1008,19 @@ def game_loop(args):
 
 
 def main():
+    """Main function.
+
+    Args:
+        -v, --verbose: print debug information
+        --host: IP of the host server (default: localhost)
+        -p, --port: TCP port to listen to (default: 2000)
+        -a, --autopilot: enable autopilot
+        -q, --quality-level: graphics quality level [Low or Epic]
+        -i, --images-to-disk: save images to disk
+        -c, --carla-settings: Path to CarlaSettings.ini file
+    """
     argparser = argparse.ArgumentParser(
-        description='CARLA Manual Control Client')
+        description='CARLA Lane Keep Asistant System (LKAS) Client')
     argparser.add_argument(
         '-v', '--verbose',
         action='store_true',
@@ -720,6 +1056,13 @@ def main():
         metavar='NAME',
         default='hero',
         help='actor role name (default: "hero")')
+    argparser.add_argument(
+        '--control-method',
+        metavar='CONTROL_METHOD',
+        dest='control_method',
+        choices = {'PurePursuit','Stanley','MPC'},
+        default='MPC',
+        help='Select control method for Lane Keeping Assist : PurePursuit, Stanley or MPC')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
@@ -728,8 +1071,6 @@ def main():
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
 
     logging.info('listening to server %s:%s', args.host, args.port)
-
-    print(__doc__)
 
     try:
 

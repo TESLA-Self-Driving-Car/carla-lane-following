@@ -656,23 +656,8 @@ def game_loop(args):
             world.render(display)
             pygame.display.flip()
 
-            if start_pose == None:
-                start_pose = curr_pose
-                prev_pose = start_pose
-            else:
-                dist_to_origin = math.sqrt(math.pow(start_pose.x - curr_pose.x, 2) \
-                    + math.pow(start_pose.y - curr_pose.y, 2))
-                dist_to_prev = math.sqrt(math.pow(curr_pose.x - prev_pose.x, 2) \
-                    + math.pow(curr_pose.y - prev_pose.y, 2))
-                distance += dist_to_prev
-                print('Odometry: {}'.format(distance), ' Distance to previous waypoint: {}'.format(dist_to_prev))
-                if distance > 100 and dist_to_origin < end_thresh:
-                    print('A loop is recorded!')
-                    break
-                elif distance > 1000:
-                    print('A track without a loop is recorded!')
-                    break
-            prev_pose = curr_pose
+            if i == len(file_waypoints)-1:
+                break
 
     finally:
 
