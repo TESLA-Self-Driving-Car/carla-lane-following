@@ -1014,7 +1014,6 @@ def main():
         -v, --verbose: print debug information
         --host: IP of the host server (default: localhost)
         -p, --port: TCP port to listen to (default: 2000)
-        -a, --autopilot: enable autopilot
         -q, --quality-level: graphics quality level [Low or Epic]
         -i, --images-to-disk: save images to disk
         -c, --carla-settings: Path to CarlaSettings.ini file
@@ -1037,10 +1036,6 @@ def main():
         default=2000,
         type=int,
         help='TCP port to listen to (default: 2000)')
-    argparser.add_argument(
-        '-a', '--autopilot',
-        action='store_true',
-        help='enable autopilot')
     argparser.add_argument(
         '--res',
         metavar='WIDTHxHEIGHT',
