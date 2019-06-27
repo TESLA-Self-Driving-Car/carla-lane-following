@@ -55,16 +55,40 @@ example_waypoint = map.get_waypoint(example_location) # map is predefined
 
 The reason of this is that "Waypoint" could not be valid or meaningful without a predefined "Map" object.
 
-## How to run
+## Prerequisites
+
+Download the latest [CARLA release](http://carla-assets-internal.s3.amazonaws.com/Releases/Linux/Dev/CARLA_Latest.tar.gz).
+
+Say you unzip to ~/carla-release
+
+git clone git@github.com:xpharry/carla-lane-following.git -b develop
+
+put following line in your ~/.bashrc file
+
+export PYTHONPATH=$PYTHONPATH:~/carla-release/PythonAPI/carla/dist/carla-0.9.5-py3.5-linux-x86_64.egg
+
+## Experiments
+
+**Test the Execution of waypoint following. Make sure pygame is installed.**
 
 Terminal 1:
 
-```
+run:
 
+```
+./CarlaUE4.sh /Game/Carla/Maps/Town05
 ```
 
 Terminal 2:
 
+run:
+
+```
+python code/generate_waypoints_with_autopilot.py
 ```
 
+then run:
+
+```
+python code/waypoint_follower_01.py --control-method MPC
 ```
